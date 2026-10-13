@@ -6,8 +6,13 @@ import sys; sys.path.append('../')
 from trident import load_wsi
 from trident.segmentation_models import segmentation_model_factory
 from trident.patch_encoder_models import encoder_factory
+from tests._test_gating import RUN_INTEGRATION_TESTS
 
-from huggingface_hub import snapshot_download
+try:
+    from huggingface_hub import snapshot_download
+    HAS_HF_HUB = True
+except Exception:
+    HAS_HF_HUB = False
 
 
 """
@@ -15,6 +20,10 @@ Test the methods of the OpenSlideWSI object, i.e. bypassing the Processor class.
 This is useful if you want to use the OpenSlideWSI class in a custom pipeline.
 """
 
+@unittest.skipUnless(
+    RUN_INTEGRATION_TESTS and HAS_HF_HUB,
+    "Set TRIDENT_RUN_INTEGRATION_TESTS=1 and install huggingface_hub to run heavy integration tests.",
+)
 class TestOpenSlideWSI(unittest.TestCase):
     HF_REPO = "MahmoodLab/unit-testing"
     TEST_SLIDE_FILENAMES = [
@@ -22,6 +31,8 @@ class TestOpenSlideWSI(unittest.TestCase):
         "TCGA-AN-A0XW-01Z-00-DX1.811E11E7-FA67-46BB-9BC6-1FD0106B789D.svs",
         "TCGA-B6-A0IJ-01Z-00-DX1.BF2E062F-06DA-4CA8-86C4-36674C035CAA.svs"
     ]
+    # MRXS (MIRAX) slide: a `.mrxs` index file plus a sibling data folder of the same name.
+    TEST_MRXS_SLIDE = os.path.join("CMU-1", "CMU-1.mrxs")
     TEST_OUTPUT_DIR = "test_single_slide_processing/"
     TEST_PATCH_ENCODER = "uni_v1"
     TEST_MAG = 20
@@ -50,36 +61,35 @@ class TestOpenSlideWSI(unittest.TestCase):
         for slide_filename in self.TEST_SLIDE_FILENAMES:
             with self.subTest(slide=slide_filename):
                 slide_path = os.path.join(self.local_wsi_dir, slide_filename)
-                slide = load_wsi(slide_path=slide_path, lazy_init=False)
+                with load_wsi(slide_path=slide_path, lazy_init=False) as slide:
+                    # Step 1: Tissue segmentation
+                    segmentation_model = segmentation_model_factory("hest")
+                    slide.segment_tissue(segmentation_model=segmentation_model, target_mag=10, job_dir=self.TEST_OUTPUT_DIR, device=self.TEST_DEVICE)
 
-                # Step 1: Tissue segmentation
-                segmentation_model = segmentation_model_factory("hest")
-                slide.segment_tissue(segmentation_model=segmentation_model, target_mag=10, job_dir=self.TEST_OUTPUT_DIR, device=self.TEST_DEVICE)
+                    # Step 2: Tissue coordinate extraction
+                    coords_path = slide.extract_tissue_coords(
+                        target_mag=self.TEST_MAG,
+                        patch_size=self.TEST_PATCH_SIZE,
+                        save_coords=self.TEST_OUTPUT_DIR
+                    )
 
-                # Step 2: Tissue coordinate extraction
-                coords_path = slide.extract_tissue_coords(
-                    target_mag=self.TEST_MAG,
-                    patch_size=self.TEST_PATCH_SIZE,
-                    save_coords=self.TEST_OUTPUT_DIR
-                )
+                    # Step 3: Visualization
+                    viz_coords_path = slide.visualize_coords(
+                        coords_path=coords_path,
+                        save_patch_viz=os.path.join(self.TEST_OUTPUT_DIR, "visualization")
+                    )
 
-                # Step 3: Visualization
-                viz_coords_path = slide.visualize_coords(
-                    coords_path=coords_path,
-                    save_patch_viz=os.path.join(self.TEST_OUTPUT_DIR, "visualization")
-                )
-
-                # Step 4: Feature extraction
-                encoder = encoder_factory(self.TEST_PATCH_ENCODER)
-                encoder.eval()
-                encoder.to(self.TEST_DEVICE)
-                features_dir = os.path.join(self.TEST_OUTPUT_DIR, f"features_{self.TEST_PATCH_ENCODER}")
-                slide.extract_patch_features(
-                    patch_encoder=encoder,
-                    coords_path=coords_path,
-                    save_features=features_dir,
-                    device=self.TEST_DEVICE
-                )
+                    # Step 4: Feature extraction
+                    encoder = encoder_factory(self.TEST_PATCH_ENCODER)
+                    encoder.eval()
+                    encoder.to(self.TEST_DEVICE)
+                    features_dir = os.path.join(self.TEST_OUTPUT_DIR, f"features_{self.TEST_PATCH_ENCODER}")
+                    slide.extract_patch_features(
+                        patch_encoder=encoder,
+                        coords_path=coords_path,
+                        save_features=features_dir,
+                        device=self.TEST_DEVICE
+                    )
 
                 # Verify outputs
                 self.assertTrue(os.path.exists(os.path.join(self.TEST_OUTPUT_DIR, "contours_geojson")), "GDF contours were not saved.")
@@ -106,6 +116,52 @@ class TestOpenSlideWSI(unittest.TestCase):
                 len(files), expected_file_count,
                 f"Expected {expected_file_count} files in '{output_dir}', but found {len(files)}."
             )
+
+    def test_mrxs_integration(self):
+        """
+        Test that an MRXS (MIRAX) slide can be read and processed end-to-end.
+
+        MRXS is a multi-file format (a `.mrxs` index file plus a sibling data
+        folder), so it exercises a different OpenSlide read path than the
+        single-file `.svs` slides above. Outputs are written to a dedicated
+        directory to avoid clashing with `test_integration`.
+        """
+        slide_path = os.path.join(self.local_wsi_dir, self.TEST_MRXS_SLIDE)
+        self.assertTrue(os.path.exists(slide_path), f"MRXS slide not found at {slide_path}.")
+
+        output_dir = os.path.join(self.TEST_OUTPUT_DIR, "mrxs")
+        os.makedirs(output_dir, exist_ok=True)
+
+        with load_wsi(slide_path=slide_path, lazy_init=False) as slide:
+            # Step 0: Metadata read from the `.mrxs` index + sibling data folder
+            self.assertEqual(len(slide.dimensions), 2)
+            self.assertTrue(all(dim > 0 for dim in slide.dimensions), "MRXS slide reported non-positive dimensions.")
+            self.assertGreater(slide.mag, 0, "MRXS slide reported non-positive magnification.")
+            self.assertGreater(slide.mpp, 0, "MRXS slide reported non-positive mpp.")
+            self.assertGreaterEqual(slide.level_count, 1)
+
+            # Step 1: Tissue segmentation
+            segmentation_model = segmentation_model_factory("hest")
+            slide.segment_tissue(segmentation_model=segmentation_model, target_mag=10, job_dir=output_dir, device=self.TEST_DEVICE)
+
+            # Step 2: Tissue coordinate extraction
+            coords_path = slide.extract_tissue_coords(
+                target_mag=self.TEST_MAG,
+                patch_size=self.TEST_PATCH_SIZE,
+                save_coords=output_dir
+            )
+
+            # Step 3: Visualization
+            viz_coords_path = slide.visualize_coords(
+                coords_path=coords_path,
+                save_patch_viz=os.path.join(output_dir, "visualization")
+            )
+
+        # Verify outputs
+        self.assertTrue(os.path.exists(os.path.join(output_dir, "contours_geojson")), "GDF contours were not saved.")
+        self.assertTrue(os.path.exists(os.path.join(output_dir, "contours")), "Contours were not saved.")
+        self.assertTrue(os.path.exists(coords_path), "Tissue coordinates file was not saved.")
+        self.assertTrue(os.path.exists(viz_coords_path), "Visualization file was not saved.")
 
 if __name__ == "__main__":
     unittest.main()

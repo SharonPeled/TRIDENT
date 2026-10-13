@@ -1,4 +1,6 @@
 {
-    "chief": "/home/sharonpe/athena/phd/CHIEF",
-    "madeleine": "./MADELEINE"
+    "chief": "./CHIEF",
+    "madeleine": "./MADELEINE",
+    "gigapath": "",
+    "gigapath-flash": ""
 }

@@ -1,15 +1,15 @@
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import os
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torchvision import transforms
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 
 from trident.IO import get_dir, get_weights_path, has_internet_connection
 
 
-class SegmentationModel(torch.nn.Module):
+class BaseSegmentationModel(torch.nn.Module, ABC):
 
     _has_internet = has_internet_connection()
 
@@ -17,28 +17,27 @@ class SegmentationModel(torch.nn.Module):
         """
         Initialize Segmentation model wrapper.
 
-        Parameters
-        ----------
-        freeze : bool, optional
-            If True, the model's parameters are frozen 
-            (i.e., not trainable) and the model is set to evaluation mode. 
-            Defaults to True.
-        confidence_thresh : float, optional
-            Threshold for prediction confidence. 
-            Predictions below this threshold may be filtered out or ignored. 
-            Default is 0.5. Set to 0.4 to keep more tissue.
-        **build_kwargs : dict
-            Additional keyword arguments passed to the internal 
-            `_build` method.
+        Parameters:
+            freeze (bool, optional):
+                If True, the model's parameters are frozen (i.e., not trainable) and the model is set to evaluation
+                mode. Defaults to True.
+            confidence_thresh (float, optional):
+                Threshold for prediction confidence. Predictions below this threshold may be filtered out or ignored.
+                Default is 0.5. Set to 0.4 to keep more tissue.
+            **build_kwargs (dict):
+                Additional keyword arguments passed to the internal `_build` method.
 
-        Attributes
-        ----------
-        model : torch.nn.Module
-            The constructed model.
-        eval_transforms : Callable
-            Transformations to apply to input data during inference.
+        Attributes:
+            model (torch.nn.Module):
+                The constructed model.
+            eval_transforms (Callable):
+                Transformations to apply to input data during inference.
+            interpolation (int or None):
+                cv2.INTER_* flag the patcher uses to resize tiles to `input_size`. None (default)
+                keeps the patcher's default (cv2.INTER_LINEAR); a subclass may set it in `_build`.
         """
         super().__init__()
+        self.interpolation = None
         self.model, self.eval_transforms = self._build(**build_kwargs)
         self.confidence_thresh = confidence_thresh
 
@@ -55,6 +54,12 @@ class SegmentationModel(torch.nn.Module):
         z = self.model(image)
         return z
         
+    @property
+    def name(self) -> Optional[str]:
+        """Canonical model id — uniform ``.name`` accessor shared across all model families
+        (set by ``segmentation_model_factory``)."""
+        return getattr(self, "model_name", None)
+
     @abstractmethod
     def _build(self, **build_kwargs: Dict[str, Any]) -> Tuple[nn.Module, transforms.Compose]:
         """
@@ -63,7 +68,11 @@ class SegmentationModel(torch.nn.Module):
         pass
 
 
-class HESTSegmenter(SegmentationModel):
+# Backward-compatible alias for the pre-rename base class.
+SegmentationModel = BaseSegmentationModel
+
+
+class HESTSegmenter(BaseSegmentationModel):
 
     def __init__(self, **build_kwargs: Dict[str, Any]):
         """
@@ -75,10 +84,8 @@ class HESTSegmenter(SegmentationModel):
         """
         Build and load HESTSegmenter model.
 
-        Returns
-        -------
-        Tuple[nn.Module, transforms.Compose]
-            Model and preprocessing transforms.
+        Returns:
+            Tuple[nn.Module, transforms.Compose]: Model and preprocessing transforms.
         """
 
         from torchvision.models.segmentation import deeplabv3_resnet50
@@ -95,7 +102,7 @@ class HESTSegmenter(SegmentationModel):
         model.classifier[4] = nn.Conv2d(256, 2, kernel_size=1, stride=1)
 
         if not weights_path:
-            if not SegmentationModel._has_internet:
+            if not BaseSegmentationModel._has_internet:
                 raise FileNotFoundError(
                     f"Internet connection not available and checkpoint not found locally in model registry at trident/segmentation_models/local_ckpts.json.\n\n"
                     f"To proceed, please manually download {model_ckpt_name} from:\n"
@@ -167,7 +174,7 @@ class JpegCompressionTransform:
         return Image.fromarray(image)
 
 
-class GrandQCArtifactSegmenter(SegmentationModel):
+class GrandQCArtifactSegmenter(BaseSegmentationModel):
 
     _class_mapping = {
         1: "Normal Tissue",
@@ -214,7 +221,7 @@ class GrandQCArtifactSegmenter(SegmentationModel):
 
         # Attempt to download if file is missing and not already available
         if not weights_path:
-            if not SegmentationModel._has_internet:
+            if not BaseSegmentationModel._has_internet:
                 raise FileNotFoundError(
                     f"Internet connection not available and checkpoint not found locally.\n\n"
                     f"To proceed, please manually download {model_ckpt_name} from:\n"
@@ -241,6 +248,8 @@ class GrandQCArtifactSegmenter(SegmentationModel):
         self.input_size = 512
         self.precision = torch.float32
         self.target_mag = 10
+        import cv2
+        self.interpolation = cv2.INTER_LANCZOS4
 
         # Evaluation transforms
         eval_transforms = transforms.Compose([
@@ -267,7 +276,7 @@ class GrandQCArtifactSegmenter(SegmentationModel):
         return predictions
 
 
-class GrandQCSegmenter(SegmentationModel):
+class GrandQCSegmenter(BaseSegmentationModel):
     
     def __init__(self, **build_kwargs):
         """
@@ -294,7 +303,7 @@ class GrandQCSegmenter(SegmentationModel):
 
         # Verify checkpoint path
         if not weights_path:
-            if not SegmentationModel._has_internet:
+            if not BaseSegmentationModel._has_internet:
                 raise FileNotFoundError(
                     f"Internet connection not available and checkpoint not found locally at '{weights_path}'.\n\n"
                     f"To proceed, please manually download {model_ckpt_name} from:\n"
@@ -326,7 +335,7 @@ class GrandQCSegmenter(SegmentationModel):
 
         # Model config
         self.input_size = 512
-        self.precision = torch.float32
+        self.precision = torch.float16
         self.target_mag = 1
 
         # Evaluation transforms
@@ -352,12 +361,52 @@ class GrandQCSegmenter(SegmentationModel):
         return predictions
 
 
+class OtsuSegmenter(BaseSegmentationModel):
+    """
+    Classical image-processing tissue segmenter based on two-pass Otsu thresholding.
+    """
+
+    def __init__(self, **build_kwargs):
+        super().__init__(**build_kwargs)
+
+    def _build(self) -> Tuple[nn.Module, transforms.Compose]:
+        # Keep API aligned with other segmenters used by WSI._segment_semantic.
+        self.input_size = 512
+        self.precision = torch.float32
+        self.target_mag = 1.25
+        eval_transforms = transforms.Compose([transforms.ToTensor()])
+        return None, eval_transforms
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        if image.ndim != 4:
+            raise ValueError(
+                f"Input must be 4D tensor (B, C, H, W), got shape={tuple(image.shape)}"
+            )
+
+        # Lazy import: only needed for the Otsu fallback segmenter.
+        import numpy as np
+        from trident.segmentation_models.model_zoo.otsu import apply_otsu_thresholding
+
+        preds = []
+        for i in range(image.shape[0]):
+            img_np = image[i].detach().permute(1, 2, 0).cpu().numpy()  # CHW -> HWC
+            img_np = np.clip(img_np * 255.0, 0, 255).astype(np.uint8)
+
+            # apply_otsu_thresholding returns background mask (1=background).
+            # TRIDENT expects tissue mask (1=tissue), so invert here.
+            background_mask = apply_otsu_thresholding(img_np)
+            tissue_mask = (1 - background_mask).astype(np.uint8)
+            preds.append(tissue_mask)
+
+        return torch.from_numpy(np.stack(preds, axis=0))
+
+
 def segmentation_model_factory(
     model_name: str, 
     confidence_thresh: float = 0.5, 
     freeze: bool = True,
     **build_kwargs,
-) -> SegmentationModel:
+) -> BaseSegmentationModel:
     """
     Factory function to build a segmentation model by name.
     """
@@ -372,10 +421,14 @@ def segmentation_model_factory(
         )
 
     if model_name == 'hest':
-        return HESTSegmenter(freeze=freeze, confidence_thresh=confidence_thresh, **build_kwargs)
+        model = HESTSegmenter(freeze=freeze, confidence_thresh=confidence_thresh, **build_kwargs)
     elif model_name == 'grandqc':
-        return GrandQCSegmenter(freeze=freeze, confidence_thresh=confidence_thresh, **build_kwargs)
+        model = GrandQCSegmenter(freeze=freeze, confidence_thresh=confidence_thresh, **build_kwargs)
     elif model_name == 'grandqc_artifact':
-        return GrandQCArtifactSegmenter(freeze=freeze, **build_kwargs)
+        model = GrandQCArtifactSegmenter(freeze=freeze, **build_kwargs)
+    elif model_name == 'otsu':
+        model = OtsuSegmenter(freeze=freeze, confidence_thresh=confidence_thresh, **build_kwargs)
     else:
         raise ValueError(f"Model type {model_name} not supported")
+    model.model_name = model_name  # canonical id for the uniform `.name` accessor
+    return model
